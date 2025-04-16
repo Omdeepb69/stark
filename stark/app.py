@@ -493,4 +493,267 @@ class StarkApp:
         new_text = current_text + "\n" + full_message if current_text else full_message
         
         # Update buffer and scroll to end
-        self.output_buffer.document = Document(text=new_text
+        # Update buffer and scroll to end
+        self.output_buffer.document = Document(text=new_text, cursor_position=len(new_text))
+        # Make sure the output buffer is updated in the TUI
+        self.pt_app.invalidate() # Force refresh
+
+    def _accept_input_handler(self, buffer):
+        """Handle input when 'Enter' is pressed on the input buffer."""
+        text = buffer.text.strip()
+        if not text:
+            return # Skip empty input
+
+        # Clear the input buffer for the next command
+        buffer.reset(append_to_history=True) # Add to buffer history for arrow-up recall
+
+        # Echo command to output
+        self._log_to_output(f"{text}", style_class="command")
+
+        # Process input using asyncio run_until_complete
+        try:
+            # Run the input handling as a coroutine
+            future = asyncio.ensure_future(self.handle_user_input(text))
+            # Return True to indicate the input was accepted
+            return True
+        except Exception as e:
+            self._log_to_output(f"Error processing input: {e}", style_class="error")
+            self.logger.exception(f"Error in input handler: {e}")
+            return True
+
+    async def handle_user_input(self, text: str):
+        """
+        Processes user input text and runs the appropriate command.
+        This is an async function to handle commands that require async operations.
+        """
+        text = text.strip()
+        if not text:
+            return
+
+        # Add to session history
+        self.session_data["history"].append(text)
+
+        # Simple command parsing (space-delimited, first word is command)
+        parts = text.split()
+        command = parts[0].lower() if parts else ""
+        args = parts[1:] if len(parts) > 1 else []
+
+        # Match command to handler using the commands dictionary
+        commands = self.get_commands()
+        if command in commands:
+            try:
+                # Call the command handler with any arguments
+                await commands[command]["handler"](*args)
+            except Exception as e:
+                self._log_to_output(f"Error executing command: {e}", style_class="error")
+                self.logger.exception(f"Error in command {command}: {e}")
+        else:
+            self._log_to_output(f"Unknown command: '{command}'. Type 'help' for available commands.", style_class="warning")
+
+    # --- Command Handlers ---
+    # Each of these corresponds to a command from get_commands()
+
+    async def command_research(self, *args):
+        """Handle the 'research' command to start a new research query."""
+        if not args:
+            self._log_to_output("Please provide a query. Usage: research <query> [--sources src1,src2]", style_class="warning")
+            return
+
+        # Parse arguments
+        query = ""
+        sources = None
+        in_sources = False
+        for arg in args:
+            if arg == "--sources":
+                in_sources = True
+                continue
+            
+            if in_sources:
+                sources = arg.split(',')
+            else:
+                query += f"{arg} "
+        
+        query = query.strip()
+        
+        if not query:
+            self._log_to_output("Please provide a research query.", style_class="warning")
+            return
+
+        self._log_to_output(f"Starting research on: '{query}'" + 
+                            (f" with sources: {sources}" if sources else ""), style_class="info")
+
+        # Update graph display to show "processing"
+        self.graph_buffer.document = Document(text="Processing research query...\nThis may take a moment.")
+        self.pt_app.invalidate()  # Force refresh
+
+        try:
+            # Call the processing engine's scrape_and_process method
+            result = await self.processor.scrape_and_process(query, sources)
+            
+            # Update session data with results
+            self.session_data['summary'] = result.get('summary', "No summary generated.")
+            self.session_data['graph'] = result.get('graph', None)
+            if 'citations' in result:
+                # Merge new citations with existing ones
+                if 'citations' not in self.session_data:
+                    self.session_data['citations'] = {}
+                self.session_data['citations'].update(result['citations'])
+
+            # Display summary in output
+            self._log_to_output(f"Research completed. Summary:", style_class="success")
+            self._log_to_output(self.session_data['summary'])
+
+            # Update graph display
+            if self.session_data['graph']:
+                graph_view = await self.processor.generate_graph_view(self.session_data['graph'])
+                self.graph_buffer.document = Document(text=graph_view)
+            
+            # Auto-save session
+            await self.command_save()
+
+        except Exception as e:
+            self._log_to_output(f"Error during research: {e}", style_class="error")
+            self.logger.exception(f"Research error: {e}")
+
+    async def command_query(self, *args):
+        """Query the collected data for specific information."""
+        if not args:
+            self._log_to_output("Please provide a query term. Usage: query <term>", style_class="warning")
+            return
+
+        query_term = " ".join(args)
+        self._log_to_output(f"Querying collected data for: '{query_term}'", style_class="query")
+        
+        # Check if we have any data to query
+        if not self.session_data.get('summary') and not self.session_data.get('graph'):
+            self._log_to_output("No research data available to query. Run a research command first.", style_class="warning")
+            return
+
+        # Use the processor to search within existing data
+        results = await self.processor.query_data(query_term, self.session_data)
+        self._log_to_output(results)
+
+    async def command_graph(self):
+        """Show the knowledge graph."""
+        if not self.session_data.get('graph'):
+            self._log_to_output("No knowledge graph available. Run a research command first.", style_class="warning")
+            return
+
+        self._log_to_output("Generating graph view...", style_class="info")
+        graph_view = await self.processor.generate_graph_view(self.session_data['graph'])
+        self.graph_buffer.document = Document(text=graph_view)
+        self._log_to_output("Graph view updated in right panel.", style_class="success")
+
+    async def command_gaps(self):
+        """Identify research gaps."""
+        if not self.session_data.get('graph') and not self.session_data.get('summary'):
+            self._log_to_output("Insufficient data to identify gaps. Run a research command first.", style_class="warning")
+            return
+
+        self._log_to_output("Analyzing for research gaps...", style_class="info")
+        gaps = await self.processor.identify_gaps(self.session_data)
+        self._log_to_output(gaps)
+
+    async def command_summary(self):
+        """Show current research summary."""
+        if not self.session_data.get('summary'):
+            self._log_to_output("No research summary available. Run a research command first.", style_class="warning")
+            return
+
+        self._log_to_output("Research Summary:", style_class="info")
+        self._log_to_output(self.session_data['summary'])
+
+    async def command_citations(self):
+        """Show collected citations."""
+        if not self.session_data.get('citations') or not self.session_data['citations']:
+            self._log_to_output("No citations available. Run a research command first.", style_class="warning")
+            return
+
+        self._log_to_output("Citations:", style_class="info")
+        for source, url in sorted(self.session_data['citations'].items()):
+            self._log_to_output(f"- {source}: {url}")
+
+    async def command_save(self):
+        """Save current session to file."""
+        if self.storage.save_session(self.session_data):
+            self._log_to_output(f"Session saved to {self.session_file}", style_class="success")
+        else:
+            self._log_to_output("Failed to save session", style_class="error")
+
+    async def command_load(self, file_path=None):
+        """Load session from file."""
+        if file_path:
+            self.session_file = file_path
+            self._log_to_output(f"Setting session file to: {file_path}", style_class="info")
+
+        loaded_data = self.storage.load_session()
+        if loaded_data:
+            self.session_data = loaded_data
+            self._log_to_output(f"Session loaded from {self.session_file}", style_class="success")
+            
+            # Update display with loaded data
+            if self.session_data.get('summary'):
+                self._log_to_output("Loaded summary:", style_class="info")
+                self._log_to_output(self.session_data['summary'])
+            
+            if self.session_data.get('graph'):
+                # Schedule graph refresh for later to avoid blocking
+                asyncio.ensure_future(self.command_graph())
+        else:
+            self._log_to_output(f"Could not load session from {self.session_file}", style_class="error")
+
+    async def command_log(self):
+        """Show application log file contents."""
+        try:
+            with open(LOG_FILE, 'r') as f:
+                # Get last N lines of log file (tail)
+                lines = f.readlines()[-50:] # Last 50 lines
+                self._log_to_output(f"Last {len(lines)} lines of log:", style_class="info")
+                self._log_to_output("".join(lines))
+        except Exception as e:
+            self._log_to_output(f"Failed to read log file: {e}", style_class="error")
+
+    async def command_clear(self):
+        """Clear the output screen."""
+        self.output_buffer.document = Document(text="")
+        self._log_to_output("Output cleared.", style_class="info")
+
+    async def command_help(self):
+        """Show help message."""
+        self.show_help = True
+        self._log_to_output("Showing help popup (Ctrl+H to close).", style_class="info")
+
+    async def command_exit(self):
+        """Exit the application."""
+        self._log_to_output("Exiting STARK...", style_class="info")
+        
+        # Prompt for save if there's unsaved data from this session
+        # This could be enhanced with a proper TUI dialog
+        if self.session_data.get('summary') or self.session_data.get('graph'):
+            # For now, just auto-save
+            self._log_to_output("Saving session before exit...", style_class="info")
+            await self.command_save()
+        
+        # Signal application to exit
+        self.running = False
+        # Schedule app exit
+        self.pt_app.exit()
+
+    def run(self):
+        """Run the STARK application."""
+        try:
+            self.pt_app.run()
+        except KeyboardInterrupt:
+            self.logger.info("STARK interrupted by user. Exiting.")
+        except Exception as e:
+            self.logger.exception(f"An unexpected error occurred: {e}")
+            print(f"\nA critical error occurred: {e}", file=sys.stderr)
+        finally:
+            # Any cleanup needed
+            self.logger.info("STARK finished.")
+
+
+# When running as a standalone module
+if __name__ == "__main__":
+    app = StarkApp()
+    app.run()
