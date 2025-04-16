@@ -1,0 +1,11 @@
+prompt_toolkit
+requests
+beautifulsoup4
+spacy (or nltk)
+transformers (optional, for advanced NLP)
+scikit-learn
+networkx
+pandas
+argparse
+rich (optional, for enhanced TUI styling)
+gensim (optional, for topic modeling alternatives)
